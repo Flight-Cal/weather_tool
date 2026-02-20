@@ -27,21 +27,20 @@ NCEI_NOAA_BASE = "https://www.ncei.noaa.gov/pub/data/noaa"
 ISD_HISTORY_URL = f"{NCEI_NOAA_BASE}/isd-history.csv"
 ISD_INVENTORY_URL = f"{NCEI_NOAA_BASE}/isd-inventory.csv"
 COUNTRY_LIST_URL = f"{NCEI_NOAA_BASE}/country-list.txt"
-
-# ISD-Lite files:
-# https://www.ncei.noaa.gov/pub/data/noaa/isd-lite/YYYY/USAF-WBAN-YYYY.gz
 ISD_LITE_BASE = f"{NCEI_NOAA_BASE}/isd-lite"
 
-# Streamlit Cloud: use a writable cache dir.
-# /tmp is safe; you can also use os.getcwd() but /tmp avoids permission surprises.
+# Streamlit Cloud writable cache dir
 CACHE_DIR = os.path.join("/tmp", "cache_isd")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Request session for connection pooling
+
+# -----------------------------
+# HTTP session (connection pooling)
+# -----------------------------
 @st.cache_resource(show_spinner=False)
 def get_http_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "isd-weekly-climatology-streamlit/1.0"})
+    s.headers.update({"User-Agent": "isd-weekly-climatology-streamlit/1.1"})
     return s
 
 
@@ -57,24 +56,36 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def safe_download_to_file(url: str, local_path: str, timeout: int = 60) -> None:
+def normalize_id(series: pd.Series, width: int) -> pd.Series:
     """
-    Download URL to local_path with streaming.
+    Normalize USAF/WBAN style identifiers to zero-padded strings.
+    Handles ints, floats-as-strings (e.g., "12345.0"), blanks.
     """
-    sess = get_http_session()
-    r = sess.get(url, stream=True, timeout=timeout)
-    r.raise_for_status()
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    with open(local_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                f.write(chunk)
+    s = series.astype(str).str.strip()
+    s = s.str.replace(r"\.0$", "", regex=True)
+    s = s.replace({"nan": "", "None": ""})
+    return s.str.zfill(width)
 
 
+def station_id(usaf, wban) -> str:
+    return f"{str(usaf).zfill(6)}-{str(wban).zfill(5)}"
+
+
+def isd_lite_url(usaf, wban, year: int) -> str:
+    return f"{ISD_LITE_BASE}/{year}/{station_id(usaf, wban)}-{year}.gz"
+
+
+def local_isd_lite_path(usaf, wban, year: int) -> str:
+    return os.path.join(CACHE_DIR, "isd-lite", str(year), f"{station_id(usaf, wban)}-{year}.gz")
+
+
+# -----------------------------
+# Load metadata
+# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_station_history() -> pd.DataFrame:
     """
-    Loads isd-history.csv and caches it in Streamlit cache (not disk).
+    Loads isd-history.csv and normalizes station IDs.
     """
     sess = get_http_session()
     r = sess.get(ISD_HISTORY_URL, timeout=60)
@@ -82,24 +93,36 @@ def load_station_history() -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(r.content))
     df.columns = [c.strip().upper() for c in df.columns]
     df = df.dropna(subset=["LAT", "LON"])
+
+    # Normalize IDs as strings
+    df["USAF"] = normalize_id(df["USAF"], 6)
+    df["WBAN"] = normalize_id(df["WBAN"], 5)
+    df["KEY"] = df["USAF"] + "-" + df["WBAN"]
     return df
 
 
 @st.cache_data(show_spinner=False)
 def load_inventory() -> pd.DataFrame:
+    """
+    Loads isd-inventory.csv and normalizes station IDs and year.
+    """
     sess = get_http_session()
     r = sess.get(ISD_INVENTORY_URL, timeout=60)
     r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
     df.columns = [c.strip().upper() for c in df.columns]
+
+    df["USAF"] = normalize_id(df["USAF"], 6)
+    df["WBAN"] = normalize_id(df["WBAN"], 5)
+    df["YEAR"] = pd.to_numeric(df["YEAR"], errors="coerce").astype("Int64")
+    df["KEY"] = df["USAF"] + "-" + df["WBAN"]
     return df
 
 
 @st.cache_data(show_spinner=False)
 def load_country_list() -> Dict[str, str]:
     """
-    Parses country-list.txt into mapping of lower(name) -> CODE.
-    This file format is odd; this parser is intentionally permissive.
+    Parses country-list.txt to mapping lower(name)->code.
     """
     sess = get_http_session()
     r = sess.get(COUNTRY_LIST_URL, timeout=60)
@@ -109,7 +132,6 @@ def load_country_list() -> Dict[str, str]:
 
     out = {}
     i = 0
-    # Skip header-ish tokens until we hit a 2-letter code.
     while i < len(tokens) and not (len(tokens[i]) == 2 and tokens[i].isalpha()):
         i += 1
 
@@ -129,15 +151,17 @@ def load_country_list() -> Dict[str, str]:
     return out
 
 
+# -----------------------------
+# Geocoding
+# -----------------------------
 @st.cache_resource(show_spinner=False)
 def get_geocoder() -> Nominatim:
-    # Streamlit Cloud runs multiple apps; user_agent must be unique-ish.
     return Nominatim(user_agent="isd_weekly_climatology_app_streamlit_cloud")
 
 
 def geocode_location(q: str) -> Optional[Tuple[float, float, str]]:
     """
-    Robust geocoding with retries. Nominatim can rate-limit.
+    Robust geocoding with retries (Nominatim can time out / rate-limit).
     """
     geocoder = get_geocoder()
     for attempt in range(3):
@@ -151,21 +175,75 @@ def geocode_location(q: str) -> Optional[Tuple[float, float, str]]:
     return None
 
 
-def station_id(usaf: int, wban: int) -> str:
-    return f"{int(usaf):06d}-{int(wban):05d}"
+# -----------------------------
+# Station selection + inventory
+# -----------------------------
+def available_years_for_station(inventory: pd.DataFrame, usaf: str, wban: str) -> List[int]:
+    key = station_id(usaf, wban)
+    inv = inventory[inventory["KEY"] == key]
+    years = sorted(inv["YEAR"].dropna().astype(int).unique().tolist())
+    return years
 
 
-def isd_lite_url(usaf: int, wban: int, year: int) -> str:
-    return f"{ISD_LITE_BASE}/{year}/{station_id(usaf, wban)}-{year}.gz"
-
-
-def local_isd_lite_path(usaf: int, wban: int, year: int) -> str:
-    return os.path.join(CACHE_DIR, "isd-lite", str(year), f"{station_id(usaf, wban)}-{year}.gz")
-
-
-def download_isd_lite(usaf: int, wban: int, year: int) -> Optional[str]:
+def pick_stations_for_query(
+    query: str,
+    stations: pd.DataFrame,
+    inventory: pd.DataFrame,
+    max_stations: int = 3,
+    radius_km: float = 60.0,
+) -> Tuple[pd.DataFrame, str]:
     """
-    Downloads the .gz file if missing. Returns path or None if 404.
+    Selection logic:
+    - Country name -> choose longest-record stations in that country
+    - Else station name match
+    - Else geocode -> nearest stations
+    """
+    q = query.strip().lower()
+    countries = load_country_list()
+
+    # Country match
+    if q in countries:
+        ctry = countries[q]
+        cand = stations[stations["CTRY"].astype(str).str.upper() == ctry].copy()
+        if cand.empty:
+            return cand, f"Country match ({ctry}) but no stations found in isd-history."
+
+        yrs = inventory.groupby("KEY")["YEAR"].nunique().rename("n_years").reset_index()
+        cand = cand.merge(yrs, on="KEY", how="left").fillna({"n_years": 0})
+        cand = cand.sort_values(["n_years"], ascending=False).head(max_stations)
+        return cand, f"Country match: {query} (CTRY={ctry}); selected {len(cand)} station(s) with longest records."
+
+    # Station name match
+    name_cand = stations[stations["STATION NAME"].astype(str).str.lower().str.contains(re.escape(q), na=False)].copy()
+    if not name_cand.empty:
+        yrs = inventory.groupby("KEY")["YEAR"].nunique().rename("n_years").reset_index()
+        name_cand = name_cand.merge(yrs, on="KEY", how="left").fillna({"n_years": 0})
+        name_cand = name_cand.sort_values(["n_years"], ascending=False).head(max_stations)
+        return name_cand, f"Name match: selected {len(name_cand)} station(s) matching '{query}'."
+
+    # Geocode + nearest
+    geo = geocode_location(query)
+    if not geo:
+        return stations.head(0), "Could not geocode the location string. Try 'Heathrow Airport, London' or 'Dublin, Ireland'."
+
+    lat, lon, addr = geo
+    cand = stations.copy()
+    cand["dist_km"] = cand.apply(lambda r: haversine_km(lat, lon, r["LAT"], r["LON"]), axis=1)
+
+    within = cand[cand["dist_km"] <= radius_km].sort_values("dist_km").head(max_stations)
+    if within.empty:
+        within = cand.sort_values("dist_km").head(max_stations)
+        return within, f"Geocoded '{query}' to {addr}; no stations within {radius_km} km, using nearest {len(within)}."
+
+    return within, f"Geocoded '{query}' to {addr}; using {len(within)} station(s) within {radius_km} km."
+
+
+# -----------------------------
+# Download + parse ISD-Lite
+# -----------------------------
+def download_isd_lite(usaf: str, wban: str, year: int) -> Optional[str]:
+    """
+    Downloads the .gz if missing. Returns local path, or None if 404.
     """
     path = local_isd_lite_path(usaf, wban, year)
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -188,42 +266,42 @@ def download_isd_lite(usaf: int, wban: int, year: int) -> Optional[str]:
 
 def parse_isd_lite_gz(path: str) -> pd.DataFrame:
     """
-    ISD-Lite fixed-width fields:
-    year(4) month(2) day(2) hour(2) temp(6) dew(6) slp(6) wd(6) ws(6) sky(6) p1(6) p6(6)
+    Robust ISD-Lite parser using whitespace-separated columns.
+    Columns:
+    year month day hour temp dew slp wdir wspd sky p1 p6
     Values scaled by 10; missing = -9999; trace precip = -1
     """
-    with gzip.open(path, "rb") as f:
-        raw = f.read()
+    with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+        data = pd.read_csv(
+            f,
+            sep=r"\s+",
+            header=None,
+            names=["year", "month", "day", "hour", "temp", "dew", "slp", "wdir", "wspd", "sky", "p1", "p6"],
+            engine="python",
+        )
 
-    data = pd.read_fwf(
-        io.BytesIO(raw),
-        widths=[4, 2, 2, 2, 6, 6, 6, 6, 6, 6, 6, 6],
-        header=None,
-        names=["year", "month", "day", "hour", "temp", "dew", "slp", "wdir", "wspd", "sky", "p1", "p6"],
-    )
-
-    # Build datetime (UTC)
+    # datetime (UTC)
     data["dt"] = pd.to_datetime(
-        data[["year", "month", "day", "hour"]].astype(int),
+        data[["year", "month", "day", "hour"]].astype("int64"),
         errors="coerce",
         utc=True,
     )
     data = data.dropna(subset=["dt"])
 
-    def scale(col: str, factor: float) -> pd.Series:
-        x = data[col].astype(float)
+    def scale(series: pd.Series, factor: float) -> pd.Series:
+        x = pd.to_numeric(series, errors="coerce").astype(float)
         x = x.where(x != -9999, np.nan)
         return x / factor
 
-    data["temp_c"] = scale("temp", 10.0)
-    data["dew_c"] = scale("dew", 10.0)
-    data["slp_hpa"] = scale("slp", 10.0)
-    data["wspd_ms"] = scale("wspd", 10.0)
-    data["sky_code"] = data["sky"].astype(float).where(data["sky"] != -9999, np.nan)
+    data["temp_c"] = scale(data["temp"], 10.0)
+    data["dew_c"] = scale(data["dew"], 10.0)
+    data["slp_hpa"] = scale(data["slp"], 10.0)
+    data["wspd_ms"] = scale(data["wspd"], 10.0)
+    data["sky_code"] = pd.to_numeric(data["sky"], errors="coerce").astype(float).where(data["sky"] != -9999, np.nan)
 
-    # Precip: prefer 1h; handle trace(-1 => 0)
-    p1 = data["p1"].astype(float).where(data["p1"] != -9999, np.nan)
-    p6 = data["p6"].astype(float).where(data["p6"] != -9999, np.nan)
+    # precip
+    p1 = pd.to_numeric(data["p1"], errors="coerce").astype(float).where(data["p1"] != -9999, np.nan)
+    p6 = pd.to_numeric(data["p6"], errors="coerce").astype(float).where(data["p6"] != -9999, np.nan)
     p1 = p1.where(p1 != -1, 0.0) / 10.0
     p6 = p6.where(p6 != -1, 0.0) / 10.0
 
@@ -232,6 +310,9 @@ def parse_isd_lite_gz(path: str) -> pd.DataFrame:
     return data[["dt", "temp_c", "dew_c", "slp_hpa", "wspd_ms", "sky_code", "prcp_mm"]]
 
 
+# -----------------------------
+# Climatology calculations
+# -----------------------------
 def describe_week(row: pd.Series) -> str:
     t = row.get("temp_mean_c", np.nan)
     tmin = row.get("temp_p10_c", np.nan)
@@ -287,87 +368,17 @@ def describe_week(row: pd.Series) -> str:
             return "breezy"
         return "windy"
 
-    # Handle NaNs cleanly in formatted string
     tmin_s = f"{tmin:.1f}" if not np.isnan(tmin) else "?"
     tmax_s = f"{tmax:.1f}" if not np.isnan(tmax) else "?"
     pr_s = f"{pr:.0f}" if not np.isnan(pr) else "?"
+
     return (
         f"{temp_bucket(t)} week (typical {tmin_s}–{tmax_s}°C), "
         f"{sky_bucket(sky)}, {pr_bucket(prh)} (~{pr_s} mm/wk), {wind_bucket(wind)}."
     )
 
 
-def available_years_for_station(inventory: pd.DataFrame, usaf: int, wban: int) -> List[int]:
-    inv = inventory[(inventory["USAF"] == usaf) & (inventory["WBAN"] == wban)]
-    years = sorted(inv["YEAR"].dropna().astype(int).unique().tolist())
-    return years
-
-
-def pick_stations_for_query(
-    query: str,
-    stations: pd.DataFrame,
-    inventory: pd.DataFrame,
-    max_stations: int = 3,
-    radius_km: float = 60.0,
-) -> Tuple[pd.DataFrame, str]:
-    """
-    Selection logic:
-    - If query matches a country name -> choose stations in that country with longest year coverage.
-    - Else try station name match.
-    - Else geocode and choose nearest stations (within radius; fallback nearest N).
-    """
-    q = query.strip().lower()
-    countries = load_country_list()
-
-    # Country match
-    if q in countries:
-        ctry = countries[q]
-        cand = stations[stations["CTRY"].astype(str).str.upper() == ctry].copy()
-        if cand.empty:
-            return cand, f"Country match ({ctry}) but no stations found in isd-history."
-
-        inv = inventory.copy()
-        inv["KEY"] = inv["USAF"].astype(str).str.zfill(6) + "-" + inv["WBAN"].astype(str).str.zfill(5)
-        yrs = inv.groupby("KEY")["YEAR"].nunique().rename("n_years").reset_index()
-
-        cand["KEY"] = cand["USAF"].astype(int).astype(str).str.zfill(6) + "-" + cand["WBAN"].astype(int).astype(str).str.zfill(5)
-        cand = cand.merge(yrs, on="KEY", how="left").fillna({"n_years": 0})
-        cand = cand.sort_values(["n_years"], ascending=False).head(max_stations)
-        return cand, f"Country match: {query} (CTRY={ctry}); selected {len(cand)} station(s) with longest records."
-
-    # Name match (airport/station)
-    name_cand = stations[stations["STATION NAME"].astype(str).str.lower().str.contains(re.escape(q), na=False)].copy()
-    if not name_cand.empty:
-        inv = inventory.copy()
-        inv["KEY"] = inv["USAF"].astype(str).str.zfill(6) + "-" + inv["WBAN"].astype(str).str.zfill(5)
-        yrs = inv.groupby("KEY")["YEAR"].nunique().rename("n_years").reset_index()
-
-        name_cand["KEY"] = name_cand["USAF"].astype(int).astype(str).str.zfill(6) + "-" + name_cand["WBAN"].astype(int).astype(str).str.zfill(5)
-        name_cand = name_cand.merge(yrs, on="KEY", how="left").fillna({"n_years": 0})
-        name_cand = name_cand.sort_values(["n_years"], ascending=False).head(max_stations)
-        return name_cand, f"Name match: selected {len(name_cand)} station(s) matching '{query}'."
-
-    # Geocode
-    geo = geocode_location(query)
-    if not geo:
-        return stations.head(0), "Could not geocode the location string. Try making it more specific (e.g., 'Heathrow Airport, London')."
-
-    lat, lon, addr = geo
-    cand = stations.copy()
-    cand["dist_km"] = cand.apply(lambda r: haversine_km(lat, lon, r["LAT"], r["LON"]), axis=1)
-
-    within = cand[cand["dist_km"] <= radius_km].sort_values("dist_km").head(max_stations)
-    if within.empty:
-        within = cand.sort_values("dist_km").head(max_stations)
-        return within, f"Geocoded '{query}' to {addr}; no stations within {radius_km} km, using nearest {len(within)}."
-
-    return within, f"Geocoded '{query}' to {addr}; using {len(within)} station(s) within {radius_km} km."
-
-
 def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
-    """
-    Builds weekly climatology (ISO week) across all years/hours in all_obs.
-    """
     df = all_obs.copy()
     iso = df["dt"].dt.isocalendar()
     df["iso_week"] = iso.week.astype(int)
@@ -397,7 +408,6 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
     out["sky_mode"] = grp["sky_code"].apply(mode_series)
 
     out = out.reset_index()
-
     out["expected_weather"] = out.apply(describe_week, axis=1)
 
     # round for display
@@ -418,12 +428,12 @@ with st.expander("How it works (important notes)", expanded=False):
     st.markdown(
         """
 - Uses NOAA/NCEI **ISD-Lite** hourly station files (one file per station per year).
-- Station metadata from `isd-history.csv` and availability by year from `isd-inventory.csv`.
+- Station metadata from `isd-history.csv`; year availability from `isd-inventory.csv`.
 - Location string handling:
   - If it matches a country name (e.g., **Ireland**), it selects stations in that country with the **longest records**.
   - Otherwise it attempts a station-name match, then falls back to geocoding + nearest stations.
-- Builds a **weekly climatology** (ISO week): aggregates all hours across all available years.
-- **Precip caveat:** ISD-Lite provides 1-hour and 6-hour accumulations; the app uses 1-hour when present, else approximates using 6-hour totals / 6.
+- Weekly climatology uses ISO week numbers and aggregates all hours across all available years.
+- **Precip caveat:** ISD-Lite provides 1-hour and 6-hour accumulations; this app uses 1-hour when present, else approximates via 6-hour totals / 6.
         """
     )
 
@@ -433,8 +443,7 @@ colA, colB, colC = st.columns(3)
 max_stations = colA.slider("Stations to blend", 1, 5, 3)
 radius_km = colB.slider("Search radius (km) for geocoded locations", 10, 300, 60)
 
-# Cloud-friendly default: not “all years” by default (keeps public app responsive).
-# User can still set to 0 for "all".
+# Cloud-friendly default to avoid huge downloads; user can set 0 for all years
 max_years = colC.slider("Max years per station (0 = all)", 0, 120, 30)
 
 run = st.button("Generate weekly table")
@@ -464,18 +473,25 @@ if run:
     st.dataframe(chosen[show_cols + extra].reset_index(drop=True), use_container_width=True)
 
     all_obs = []
-    with st.spinner("Downloading + parsing ISD-Lite files (cached on the server while it runs)..."):
+    with st.spinner("Downloading + parsing ISD-Lite files (cached while the server runs)..."):
         prog = st.progress(0.0)
 
         tasks = []
         for _, r in chosen.iterrows():
-            usaf = int(r["USAF"])
-            wban = int(r["WBAN"])
+            usaf = str(r["USAF"]).zfill(6)
+            wban = str(r["WBAN"]).zfill(5)
             years = available_years_for_station(inventory, usaf, wban)
+
             if max_years and max_years > 0:
                 years = years[-max_years:]  # newest N years
+
             for y in years:
-                tasks.append((usaf, wban, y))
+                tasks.append((usaf, wban, int(y)))
+
+        # Debug: show how many station-years will be fetched
+        st.write(f"Station-years to fetch: {len(tasks)}")
+        if len(tasks) > 0:
+            st.write("Example task:", tasks[0])
 
         total = max(len(tasks), 1)
         done = 0
@@ -483,7 +499,6 @@ if run:
         for usaf, wban, y in tasks:
             done += 1
             prog.progress(done / total)
-
             try:
                 path = download_isd_lite(usaf, wban, y)
                 if path is None:
@@ -491,7 +506,6 @@ if run:
                 df = parse_isd_lite_gz(path)
                 all_obs.append(df)
             except Exception:
-                # Skip problematic station-years rather than failing the entire run
                 continue
 
     if not all_obs:
@@ -499,9 +513,18 @@ if run:
         st.stop()
 
     obs = pd.concat(all_obs, ignore_index=True)
+
+    # If temp is all missing, you'll see 0 after this
     obs = obs.dropna(subset=["temp_c"], how="all")
 
     st.success(f"Loaded {len(obs):,} hourly observations.")
+
+    if len(obs) == 0:
+        st.error(
+            "Data loaded but contained no valid temperature observations after cleaning. "
+            "Try a different station or reduce the filtering."
+        )
+        st.stop()
 
     weekly = build_weekly_climatology(obs)
 
