@@ -357,8 +357,6 @@ def parse_isd_lite_gz(path: str) -> pd.DataFrame:
 # -----------------------------
 def describe_week(row: pd.Series) -> str:
     t = row.get("temp_mean_c", np.nan)
-    pr = row.get("prcp_week_mm", np.nan)
-    prh = row.get("prcp_hours_pct", np.nan)
     wind = row.get("wind_mean_ms", np.nan)
     sky = row.get("sky_mode", np.nan)
 
@@ -388,17 +386,6 @@ def describe_week(row: pd.Series) -> str:
             return "mostly cloudy"
         return "often obscured"
 
-    def pr_bucket(pct):
-        if np.isnan(pct):
-            return "unknown rain risk"
-        if pct < 5:
-            return "very low rain risk"
-        if pct < 15:
-            return "low rain risk"
-        if pct < 30:
-            return "moderate rain risk"
-        return "high rain risk"
-
     def wind_bucket(x):
         if np.isnan(x):
             return "variable winds"
@@ -409,23 +396,25 @@ def describe_week(row: pd.Series) -> str:
         return "windy"
 
     t_s = f"{t:.1f}" if not np.isnan(t) else "?"
-    pr_s = f"{pr:.0f}" if not np.isnan(pr) else "?"
 
     return (
         f"{temp_bucket(t)} week (mean {t_s}°C), "
-        f"{sky_bucket(sky)}, {pr_bucket(prh)} (~{pr_s} mm/wk), {wind_bucket(wind)}."
+        f"{sky_bucket(sky)}, {wind_bucket(wind)}."
     )
 
 
-def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
+def build_period_climatology(all_obs: pd.DataFrame, period_mode: str) -> pd.DataFrame:
     df = all_obs.copy()
-    iso = df["dt"].dt.isocalendar()
-    df["iso_week"] = iso.week.astype(int)
+    if period_mode == "month":
+        df["period"] = df["dt"].dt.month.astype(int)
+    else:
+        iso = df["dt"].dt.isocalendar()
+        df["period"] = iso.week.astype(int)
 
     df["prcp_pos"] = df["prcp_mm"].fillna(0) > 0.0
-    grp = df.groupby("iso_week")
+    grp = df.groupby("period")
 
-    out = pd.DataFrame({"week": sorted(df["iso_week"].dropna().unique().tolist())}).set_index("week")
+    out = pd.DataFrame({"period": sorted(df["period"].dropna().unique().tolist())}).set_index("period")
 
     out["temp_mean_c"] = grp["temp_c"].mean()
     out["dew_mean_c"] = grp["dew_c"].mean()
@@ -436,7 +425,7 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
 
     clear_sky = df["sky_code"].le(2)
     clear_sky = clear_sky.where(df["sky_code"].notna(), np.nan)
-    out["clear_sky_hours_per_day"] = clear_sky.groupby(df["iso_week"]).mean() * 24.0
+    out["clear_sky_hours_per_day"] = clear_sky.groupby(df["period"]).mean() * 24.0
 
     def mode_series(s: pd.Series):
         s = s.dropna().astype(int)
@@ -455,7 +444,62 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
     out["prcp_week_mm"] = pd.to_numeric(out["prcp_week_mm"], errors="coerce").round(0)
     out["prcp_hours_pct"] = pd.to_numeric(out["prcp_hours_pct"], errors="coerce").round(1)
 
-    return out.sort_values("week")
+    return out.sort_values("period")
+
+
+def calculate_hours_above_solar_angle(latitude_deg: float, day_of_year: int, sun_angle_deg: float) -> float:
+    """
+    Approximate daily hours when the Sun is above a requested elevation angle.
+
+    Uses a standard declination approximation and solves for the hour angle where
+    solar elevation equals `sun_angle_deg`.
+    """
+    lat = math.radians(latitude_deg)
+    angle = math.radians(sun_angle_deg)
+
+    # Approximate declination (radians), good enough for climatology-style estimates.
+    decl = math.radians(23.44) * math.sin((2.0 * math.pi / 365.0) * (day_of_year - 81))
+
+    denom = math.cos(lat) * math.cos(decl)
+    if abs(denom) < 1e-12:
+        # Near poles + solstice edge-case fallback.
+        midday_sin_elev = math.sin(lat) * math.sin(decl)
+        return 24.0 if midday_sin_elev >= math.sin(angle) else 0.0
+
+    cos_hour_angle = (math.sin(angle) - (math.sin(lat) * math.sin(decl))) / denom
+
+    if cos_hour_angle >= 1.0:
+        return 0.0
+    if cos_hour_angle <= -1.0:
+        return 24.0
+
+    hour_angle = math.acos(cos_hour_angle)
+    return (24.0 / math.pi) * hour_angle
+
+
+def build_period_sun_angle_hours(latitude_deg: float, sun_angle_deg: float, period_mode: str) -> pd.DataFrame:
+    """
+    Build weekly mean daily hours above the selected sun angle.
+    """
+    dates = pd.date_range("2021-01-01", "2021-12-31", freq="D")
+    sun = pd.DataFrame({"date": dates})
+    if period_mode == "month":
+        sun["period"] = sun["date"].dt.month.astype(int)
+    else:
+        sun["period"] = sun["date"].dt.isocalendar().week.astype(int)
+    sun["day_of_year"] = sun["date"].dt.dayofyear
+    sun["hours_above_angle"] = sun["day_of_year"].apply(
+        lambda d: calculate_hours_above_solar_angle(latitude_deg, int(d), sun_angle_deg)
+    )
+
+    by_period = (
+        sun.groupby("period")["hours_above_angle"]
+        .mean()
+        .reset_index()
+        .rename(columns={"hours_above_angle": "sun_angle_hours_per_day"})
+    )
+    by_period["sun_angle_hours_per_day"] = by_period["sun_angle_hours_per_day"].round(1)
+    return by_period
 
 
 # -----------------------------
@@ -472,6 +516,8 @@ with st.expander("How it works (important notes)", expanded=False):
   - If it matches a country name (e.g., **Ireland**), it selects stations **spread across the country** while still favoring longer records.
   - Otherwise it attempts a station-name match, then falls back to geocoding + nearest stations.
 - Weekly climatology uses ISO week numbers and aggregates all hours across all available years.
+- Output can be grouped by ISO week or calendar month.
+- Sun-angle hours/day are estimated from station latitude and solar geometry for each selected period.
 - **Precip caveat:** ISD-Lite provides 1-hour and 6-hour accumulations; this app uses 1-hour when present, else approximates via 6-hour totals / 6.
         """
     )
@@ -484,6 +530,10 @@ radius_km = colB.slider("Search radius (km) for geocoded locations", 10, 300, 60
 
 # Cloud-friendly default to avoid huge downloads; user can set 0 for all years
 max_years = colC.slider("Max years per station (0 = all)", 0, 120, 30)
+
+sun_angle_deg = st.slider("Sun angle threshold (° above horizon)", -6, 70, 15)
+period_mode_label = st.selectbox("Output grouping", ["ISO weeks", "Months"], index=0)
+period_mode = "iso_week" if period_mode_label == "ISO weeks" else "month"
 
 run = st.button("Generate weekly table")
 
@@ -565,35 +615,36 @@ if run:
         )
         st.stop()
 
-    weekly = build_weekly_climatology(obs)
+    weekly = build_period_climatology(obs, period_mode=period_mode)
+    reference_lat = float(chosen["LAT"].mean())
+    sun_weekly = build_period_sun_angle_hours(reference_lat, float(sun_angle_deg), period_mode=period_mode)
+    weekly = weekly.merge(sun_weekly, on="period", how="left")
+
+    period_label = "ISO week" if period_mode == "iso_week" else "Month"
 
     output_weekly = weekly[
         [
-            "week",
+            "period",
             "expected_weather",
             "temp_mean_c",
-            "dew_mean_c",
             "slp_mean_hpa",
             "wind_mean_ms",
-            "prcp_week_mm",
-            "sky_mode",
             "clear_sky_hours_per_day",
+            "sun_angle_hours_per_day",
         ]
     ].rename(
         columns={
-            "week": "ISO week",
+            "period": period_label,
             "expected_weather": "Expected weather",
             "temp_mean_c": "Temp mean (°C)",
-            "dew_mean_c": "Dew mean (°C)",
             "slp_mean_hpa": "SLP mean (hPa)",
             "wind_mean_ms": "Wind mean (m/s)",
-            "prcp_week_mm": "Precip (mm/week)",
-            "sky_mode": "Sky code (mode)",
             "clear_sky_hours_per_day": "Clear sky hours/day",
+            "sun_angle_hours_per_day": f"Hours/day above {sun_angle_deg}° sun angle",
         }
     )
 
-    st.subheader("Weekly expected weather (climatology)")
+    st.subheader(f"{period_mode_label} expected weather (climatology)")
     st.dataframe(output_weekly, use_container_width=True, hide_index=True)
 
     csv = output_weekly.to_csv(index=False).encode("utf-8")
