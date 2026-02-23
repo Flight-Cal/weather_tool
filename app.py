@@ -567,25 +567,34 @@ if run:
 
     weekly = build_weekly_climatology(obs)
 
-    st.subheader("Weekly expected weather (climatology)")
-    st.dataframe(
-        weekly.rename(
-            columns={
-                "week": "ISO week",
-                "temp_mean_c": "Temp mean (°C)",
-                "dew_mean_c": "Dew mean (°C)",
-                "slp_mean_hpa": "SLP mean (hPa)",
-                "wind_mean_ms": "Wind mean (m/s)",
-                "prcp_week_mm": "Precip (mm/week)",
-                "prcp_hours_pct": "Hours w/ precip (%)",
-                "sky_mode": "Sky code (mode)",
-                "clear_sky_hours_per_day": "Clear sky hours/day",
-                "expected_weather": "Expected weather",
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
+    output_weekly = weekly[
+        [
+            "week",
+            "expected_weather",
+            "temp_mean_c",
+            "dew_mean_c",
+            "slp_mean_hpa",
+            "wind_mean_ms",
+            "prcp_week_mm",
+            "sky_mode",
+            "clear_sky_hours_per_day",
+        ]
+    ].rename(
+        columns={
+            "week": "ISO week",
+            "expected_weather": "Expected weather",
+            "temp_mean_c": "Temp mean (°C)",
+            "dew_mean_c": "Dew mean (°C)",
+            "slp_mean_hpa": "SLP mean (hPa)",
+            "wind_mean_ms": "Wind mean (m/s)",
+            "prcp_week_mm": "Precip (mm/week)",
+            "sky_mode": "Sky code (mode)",
+            "clear_sky_hours_per_day": "Clear sky hours/day",
+        }
     )
 
-    csv = weekly.to_csv(index=False).encode("utf-8")
+    st.subheader("Weekly expected weather (climatology)")
+    st.dataframe(output_weekly, use_container_width=True, hide_index=True)
+
+    csv = output_weekly.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", data=csv, file_name="weekly_weather_patterns.csv", mime="text/csv")
