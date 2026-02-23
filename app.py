@@ -451,9 +451,9 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
 
     # round for display
     for c in ["temp_mean_c", "dew_mean_c", "slp_mean_hpa", "wind_mean_ms", "clear_sky_hours_per_day"]:
-        out[c] = out[c].round(1)
-    out["prcp_week_mm"] = out["prcp_week_mm"].round(0)
-    out["prcp_hours_pct"] = out["prcp_hours_pct"].round(1)
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(1)
+    out["prcp_week_mm"] = pd.to_numeric(out["prcp_week_mm"], errors="coerce").round(0)
+    out["prcp_hours_pct"] = pd.to_numeric(out["prcp_hours_pct"], errors="coerce").round(1)
 
     return out.sort_values("week")
 
