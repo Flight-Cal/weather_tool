@@ -357,8 +357,6 @@ def parse_isd_lite_gz(path: str) -> pd.DataFrame:
 # -----------------------------
 def describe_week(row: pd.Series) -> str:
     t = row.get("temp_mean_c", np.nan)
-    tmin = row.get("temp_p10_c", np.nan)
-    tmax = row.get("temp_p90_c", np.nan)
     pr = row.get("prcp_week_mm", np.nan)
     prh = row.get("prcp_hours_pct", np.nan)
     wind = row.get("wind_mean_ms", np.nan)
@@ -410,12 +408,11 @@ def describe_week(row: pd.Series) -> str:
             return "breezy"
         return "windy"
 
-    tmin_s = f"{tmin:.1f}" if not np.isnan(tmin) else "?"
-    tmax_s = f"{tmax:.1f}" if not np.isnan(tmax) else "?"
+    t_s = f"{t:.1f}" if not np.isnan(t) else "?"
     pr_s = f"{pr:.0f}" if not np.isnan(pr) else "?"
 
     return (
-        f"{temp_bucket(t)} week (typical {tmin_s}–{tmax_s}°C), "
+        f"{temp_bucket(t)} week (mean {t_s}°C), "
         f"{sky_bucket(sky)}, {pr_bucket(prh)} (~{pr_s} mm/wk), {wind_bucket(wind)}."
     )
 
@@ -431,15 +428,15 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({"week": sorted(df["iso_week"].dropna().unique().tolist())}).set_index("week")
 
     out["temp_mean_c"] = grp["temp_c"].mean()
-    out["temp_p10_c"] = grp["temp_c"].quantile(0.10)
-    out["temp_p90_c"] = grp["temp_c"].quantile(0.90)
     out["dew_mean_c"] = grp["dew_c"].mean()
     out["slp_mean_hpa"] = grp["slp_hpa"].mean()
     out["wind_mean_ms"] = grp["wspd_ms"].mean()
-    out["wind_p90_ms"] = grp["wspd_ms"].quantile(0.90)
-
     out["prcp_week_mm"] = grp["prcp_mm"].sum(min_count=1)
     out["prcp_hours_pct"] = grp["prcp_pos"].mean() * 100.0
+
+    clear_sky = df["sky_code"].le(2)
+    clear_sky = clear_sky.where(df["sky_code"].notna(), np.nan)
+    out["clear_sky_hours_per_day"] = clear_sky.groupby(df["iso_week"]).mean() * 24.0
 
     def mode_series(s: pd.Series):
         s = s.dropna().astype(int)
@@ -453,7 +450,7 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
     out["expected_weather"] = out.apply(describe_week, axis=1)
 
     # round for display
-    for c in ["temp_mean_c", "temp_p10_c", "temp_p90_c", "dew_mean_c", "slp_mean_hpa", "wind_mean_ms", "wind_p90_ms"]:
+    for c in ["temp_mean_c", "dew_mean_c", "slp_mean_hpa", "wind_mean_ms", "clear_sky_hours_per_day"]:
         out[c] = out[c].round(1)
     out["prcp_week_mm"] = out["prcp_week_mm"].round(0)
     out["prcp_hours_pct"] = out["prcp_hours_pct"].round(1)
@@ -576,15 +573,13 @@ if run:
             columns={
                 "week": "ISO week",
                 "temp_mean_c": "Temp mean (°C)",
-                "temp_p10_c": "Temp p10 (°C)",
-                "temp_p90_c": "Temp p90 (°C)",
                 "dew_mean_c": "Dew mean (°C)",
                 "slp_mean_hpa": "SLP mean (hPa)",
                 "wind_mean_ms": "Wind mean (m/s)",
-                "wind_p90_ms": "Wind p90 (m/s)",
                 "prcp_week_mm": "Precip (mm/week)",
                 "prcp_hours_pct": "Hours w/ precip (%)",
                 "sky_mode": "Sky code (mode)",
+                "clear_sky_hours_per_day": "Clear sky hours/day",
                 "expected_weather": "Expected weather",
             }
         ),
