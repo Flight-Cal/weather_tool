@@ -201,6 +201,45 @@ def pick_stations_for_query(
     q = query.strip().lower()
     countries = load_country_list()
 
+    def pick_spatially_distributed_stations(candidates: pd.DataFrame, limit: int) -> pd.DataFrame:
+        """
+        Greedy max-min selector to spread stations across a country while still
+        favoring long records.
+        """
+        if candidates.empty or limit <= 0:
+            return candidates.head(0)
+
+        pool = candidates.copy()
+        pool = pool.sort_values(["n_years"], ascending=False).reset_index(drop=True)
+
+        selected_idx = [0]  # seed with the longest-record station
+        while len(selected_idx) < min(limit, len(pool)):
+            best_idx = None
+            best_score = -np.inf
+
+            for idx, row in pool.iterrows():
+                if idx in selected_idx:
+                    continue
+
+                selected_rows = pool.loc[selected_idx]
+                distances = selected_rows.apply(
+                    lambda s: haversine_km(row["LAT"], row["LON"], s["LAT"], s["LON"]), axis=1
+                )
+                min_distance = float(distances.min()) if not distances.empty else 0.0
+
+                # Keep record quality in play so very short records do not dominate.
+                score = min_distance + (float(row["n_years"]) * 10.0)
+
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+            if best_idx is None:
+                break
+            selected_idx.append(best_idx)
+
+        return pool.loc[selected_idx].copy()
+
     # Country match
     if q in countries:
         ctry = countries[q]
@@ -210,8 +249,11 @@ def pick_stations_for_query(
 
         yrs = inventory.groupby("KEY")["YEAR"].nunique().rename("n_years").reset_index()
         cand = cand.merge(yrs, on="KEY", how="left").fillna({"n_years": 0})
-        cand = cand.sort_values(["n_years"], ascending=False).head(max_stations)
-        return cand, f"Country match: {query} (CTRY={ctry}); selected {len(cand)} station(s) with longest records."
+        cand = pick_spatially_distributed_stations(cand, max_stations)
+        return cand, (
+            f"Country match: {query} (CTRY={ctry}); selected {len(cand)} station(s) "
+            "spread across the country while preferring long records."
+        )
 
     # Station name match
     name_cand = stations[stations["STATION NAME"].astype(str).str.lower().str.contains(re.escape(q), na=False)].copy()
@@ -430,7 +472,7 @@ with st.expander("How it works (important notes)", expanded=False):
 - Uses NOAA/NCEI **ISD-Lite** hourly station files (one file per station per year).
 - Station metadata from `isd-history.csv`; year availability from `isd-inventory.csv`.
 - Location string handling:
-  - If it matches a country name (e.g., **Ireland**), it selects stations in that country with the **longest records**.
+  - If it matches a country name (e.g., **Ireland**), it selects stations **spread across the country** while still favoring longer records.
   - Otherwise it attempts a station-name match, then falls back to geocoding + nearest stations.
 - Weekly climatology uses ISO week numbers and aggregates all hours across all available years.
 - **Precip caveat:** ISD-Lite provides 1-hour and 6-hour accumulations; this app uses 1-hour when present, else approximates via 6-hour totals / 6.
