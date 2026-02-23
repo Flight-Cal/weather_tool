@@ -201,6 +201,45 @@ def pick_stations_for_query(
     q = query.strip().lower()
     countries = load_country_list()
 
+    def pick_spatially_distributed_stations(candidates: pd.DataFrame, limit: int) -> pd.DataFrame:
+        """
+        Greedy max-min selector to spread stations across a country while still
+        favoring long records.
+        """
+        if candidates.empty or limit <= 0:
+            return candidates.head(0)
+
+        pool = candidates.copy()
+        pool = pool.sort_values(["n_years"], ascending=False).reset_index(drop=True)
+
+        selected_idx = [0]  # seed with the longest-record station
+        while len(selected_idx) < min(limit, len(pool)):
+            best_idx = None
+            best_score = -np.inf
+
+            for idx, row in pool.iterrows():
+                if idx in selected_idx:
+                    continue
+
+                selected_rows = pool.loc[selected_idx]
+                distances = selected_rows.apply(
+                    lambda s: haversine_km(row["LAT"], row["LON"], s["LAT"], s["LON"]), axis=1
+                )
+                min_distance = float(distances.min()) if not distances.empty else 0.0
+
+                # Keep record quality in play so very short records do not dominate.
+                score = min_distance + (float(row["n_years"]) * 10.0)
+
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+            if best_idx is None:
+                break
+            selected_idx.append(best_idx)
+
+        return pool.loc[selected_idx].copy()
+
     # Country match
     if q in countries:
         ctry = countries[q]
@@ -210,8 +249,11 @@ def pick_stations_for_query(
 
         yrs = inventory.groupby("KEY")["YEAR"].nunique().rename("n_years").reset_index()
         cand = cand.merge(yrs, on="KEY", how="left").fillna({"n_years": 0})
-        cand = cand.sort_values(["n_years"], ascending=False).head(max_stations)
-        return cand, f"Country match: {query} (CTRY={ctry}); selected {len(cand)} station(s) with longest records."
+        cand = pick_spatially_distributed_stations(cand, max_stations)
+        return cand, (
+            f"Country match: {query} (CTRY={ctry}); selected {len(cand)} station(s) "
+            "spread across the country while preferring long records."
+        )
 
     # Station name match
     name_cand = stations[stations["STATION NAME"].astype(str).str.lower().str.contains(re.escape(q), na=False)].copy()
@@ -315,8 +357,6 @@ def parse_isd_lite_gz(path: str) -> pd.DataFrame:
 # -----------------------------
 def describe_week(row: pd.Series) -> str:
     t = row.get("temp_mean_c", np.nan)
-    tmin = row.get("temp_p10_c", np.nan)
-    tmax = row.get("temp_p90_c", np.nan)
     pr = row.get("prcp_week_mm", np.nan)
     prh = row.get("prcp_hours_pct", np.nan)
     wind = row.get("wind_mean_ms", np.nan)
@@ -368,12 +408,11 @@ def describe_week(row: pd.Series) -> str:
             return "breezy"
         return "windy"
 
-    tmin_s = f"{tmin:.1f}" if not np.isnan(tmin) else "?"
-    tmax_s = f"{tmax:.1f}" if not np.isnan(tmax) else "?"
+    t_s = f"{t:.1f}" if not np.isnan(t) else "?"
     pr_s = f"{pr:.0f}" if not np.isnan(pr) else "?"
 
     return (
-        f"{temp_bucket(t)} week (typical {tmin_s}–{tmax_s}°C), "
+        f"{temp_bucket(t)} week (mean {t_s}°C), "
         f"{sky_bucket(sky)}, {pr_bucket(prh)} (~{pr_s} mm/wk), {wind_bucket(wind)}."
     )
 
@@ -389,15 +428,15 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({"week": sorted(df["iso_week"].dropna().unique().tolist())}).set_index("week")
 
     out["temp_mean_c"] = grp["temp_c"].mean()
-    out["temp_p10_c"] = grp["temp_c"].quantile(0.10)
-    out["temp_p90_c"] = grp["temp_c"].quantile(0.90)
     out["dew_mean_c"] = grp["dew_c"].mean()
     out["slp_mean_hpa"] = grp["slp_hpa"].mean()
     out["wind_mean_ms"] = grp["wspd_ms"].mean()
-    out["wind_p90_ms"] = grp["wspd_ms"].quantile(0.90)
-
     out["prcp_week_mm"] = grp["prcp_mm"].sum(min_count=1)
     out["prcp_hours_pct"] = grp["prcp_pos"].mean() * 100.0
+
+    clear_sky = df["sky_code"].le(2)
+    clear_sky = clear_sky.where(df["sky_code"].notna(), np.nan)
+    out["clear_sky_hours_per_day"] = clear_sky.groupby(df["iso_week"]).mean() * 24.0
 
     def mode_series(s: pd.Series):
         s = s.dropna().astype(int)
@@ -411,10 +450,10 @@ def build_weekly_climatology(all_obs: pd.DataFrame) -> pd.DataFrame:
     out["expected_weather"] = out.apply(describe_week, axis=1)
 
     # round for display
-    for c in ["temp_mean_c", "temp_p10_c", "temp_p90_c", "dew_mean_c", "slp_mean_hpa", "wind_mean_ms", "wind_p90_ms"]:
-        out[c] = out[c].round(1)
-    out["prcp_week_mm"] = out["prcp_week_mm"].round(0)
-    out["prcp_hours_pct"] = out["prcp_hours_pct"].round(1)
+    for c in ["temp_mean_c", "dew_mean_c", "slp_mean_hpa", "wind_mean_ms", "clear_sky_hours_per_day"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(1)
+    out["prcp_week_mm"] = pd.to_numeric(out["prcp_week_mm"], errors="coerce").round(0)
+    out["prcp_hours_pct"] = pd.to_numeric(out["prcp_hours_pct"], errors="coerce").round(1)
 
     return out.sort_values("week")
 
@@ -430,7 +469,7 @@ with st.expander("How it works (important notes)", expanded=False):
 - Uses NOAA/NCEI **ISD-Lite** hourly station files (one file per station per year).
 - Station metadata from `isd-history.csv`; year availability from `isd-inventory.csv`.
 - Location string handling:
-  - If it matches a country name (e.g., **Ireland**), it selects stations in that country with the **longest records**.
+  - If it matches a country name (e.g., **Ireland**), it selects stations **spread across the country** while still favoring longer records.
   - Otherwise it attempts a station-name match, then falls back to geocoding + nearest stations.
 - Weekly climatology uses ISO week numbers and aggregates all hours across all available years.
 - **Precip caveat:** ISD-Lite provides 1-hour and 6-hour accumulations; this app uses 1-hour when present, else approximates via 6-hour totals / 6.
@@ -534,15 +573,13 @@ if run:
             columns={
                 "week": "ISO week",
                 "temp_mean_c": "Temp mean (°C)",
-                "temp_p10_c": "Temp p10 (°C)",
-                "temp_p90_c": "Temp p90 (°C)",
                 "dew_mean_c": "Dew mean (°C)",
                 "slp_mean_hpa": "SLP mean (hPa)",
                 "wind_mean_ms": "Wind mean (m/s)",
-                "wind_p90_ms": "Wind p90 (m/s)",
                 "prcp_week_mm": "Precip (mm/week)",
                 "prcp_hours_pct": "Hours w/ precip (%)",
                 "sky_mode": "Sky code (mode)",
+                "clear_sky_hours_per_day": "Clear sky hours/day",
                 "expected_weather": "Expected weather",
             }
         ),
